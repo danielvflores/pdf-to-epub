@@ -162,40 +162,61 @@ class PDFtoEPUBConverter:
                 'total_pages': len(doc)
             }
         }
-        
         for page_num in range(len(doc)):
             page = doc[page_num]
-            text_blocks = page.get_text("dict")
-            for block in text_blocks["blocks"]:
+            page_rect = page.rect
+            page_height = page_rect.height
+            text_dict = page.get_text("dict")
+            for block in text_dict.get("blocks", []):
                 if "lines" in block:
+                    bbox = block.get('bbox', None)
+                    y_pos = bbox[1] if bbox and len(bbox) >= 4 else 0
+                    block_text = ""
+                    font_info = {}
                     for line in block["lines"]:
                         for span in line["spans"]:
                             text = span["text"].strip()
                             if text:
-                                content['text_blocks'].append({
-                                    'text': text,
-                                    'page': page_num + 1,
-                                    'font_size': span.get('size', 12),
-                                    'font_flags': span.get('flags', 0)
-                                })
-            
+                                block_text += text + " "
+                                if not font_info:
+                                    font_info = {
+                                        'font': span.get('font', ''),
+                                        'size': span.get('size', 12),
+                                        'flags': span.get('flags', 0)
+                                    }
+                    block_text = block_text.strip()
+                    if block_text:
+                        content['text_blocks'].append({
+                            'text': block_text,
+                            'page': page_num + 1,
+                            'font_info': font_info,
+                            'bbox': bbox,
+                            'y_position': y_pos,
+                            'page_height': page_height
+                        })
+
             image_list = page.get_images()
             for img_index, img in enumerate(image_list):
                 try:
                     xref = img[0]
                     pix = fitz.Pixmap(doc, xref)
-                    if pix.n - pix.alpha < 4:
+                    if pix.n - getattr(pix, 'alpha', 0) < 4:
                         img_data = pix.tobytes("png")
                         content['images'].append({
                             'data': img_data,
                             'filename': f"image_p{page_num+1}_{img_index}.png",
-                            'page': page_num + 1
+                            'page': page_num + 1,
+                            'page_height': page_height
                         })
                     pix = None
-                except:
+                except Exception:
                     logger.warning(f"⚠️  Error extrayendo imagen en página {page_num+1}")
-        
+
         doc.close()
+
+        # Detect and filter headers/footers from text_blocks
+        content['text_blocks'] = self._detect_and_filter_headers_footers(content['text_blocks'], content['metadata']['total_pages'])
+
         logger.info(f"✅ Extraídos {len(content['text_blocks'])} bloques de texto y {len(content['images'])} imágenes")
         return content
 
@@ -216,6 +237,7 @@ class PDFtoEPUBConverter:
         for page_num in range(len(doc)):
             page = doc[page_num]
             page_elements = []
+            page_rect = page.rect  # dimensiones de la página
             text_dict = page.get_text("dict")
             images = page.get_images()
             
@@ -294,7 +316,8 @@ class PDFtoEPUBConverter:
                                 'bbox': bbox,
                                 'page': page_num + 1,
                                 'font_info': font_info,
-                                'y_position': bbox[1]
+                                'y_position': bbox[1],
+                                'page_height': page_rect.height
                             })
             
             page_elements.extend(independent_text_blocks)
@@ -310,8 +333,9 @@ class PDFtoEPUBConverter:
                                 'data': img_bytes,
                                 'filename': f"img_p{page_num+1:03d}_{img_data['index']:02d}.png",
                                 'page': page_num + 1,
-                                'bbox': img_data['original_rect'],
-                                'y_position': img_data['original_rect'][1] if img_data['original_rect'] else float(page_num * 1000 + img_data['index'])
+                                                'bbox': img_data['original_rect'],
+                                                'y_position': img_data['original_rect'][1] if img_data['original_rect'] else float(page_num * 1000 + img_data['index']),
+                                                'page_height': page_rect.height
                             })
                         pix = None
                     except Exception as e:
@@ -334,6 +358,7 @@ class PDFtoEPUBConverter:
                         'page': page_num + 1,
                         'bbox': combined_rect,
                         'y_position': combined_rect[1],
+                        'page_height': page_rect.height,
                         'is_combined': True,
                         'text_count': len(overlap_data['texts'])
                     })
@@ -346,6 +371,10 @@ class PDFtoEPUBConverter:
             total_elements += len(page_elements)
         
         doc.close()
+
+        # Primero detectar y filtrar encabezados/pies repetidos dinámicamente
+        content['elements'] = self._detect_and_filter_headers_footers(content['elements'], content['metadata']['total_pages'])
+
         cleaned_elements = self.clean_structured_content(content['elements'], content['metadata']['total_pages'])
         content['elements'] = cleaned_elements
         logger.info(f"✅ Extraídos {len(content['elements'])} elementos estructurados ({total_elements - len(cleaned_elements)} eliminados por limpieza)")
@@ -381,6 +410,136 @@ class PDFtoEPUBConverter:
 
     def _combine_rects(self, rect1: fitz.Rect, rect2: fitz.Rect) -> fitz.Rect:
         return fitz.Rect(min(rect1[0], rect2[0]), min(rect1[1], rect2[1]), max(rect1[2], rect2[2]), max(rect1[3], rect2[3]))
+
+    def _normalize_text_key(self, text: str) -> str:
+        """Normaliza texto para comparación: minúsculas, quitar múltiples espacios y caracteres de control."""
+        if not text:
+            return ""
+        t = re.sub(r"\s+", " ", text.strip().lower())
+        return t
+
+    def _detect_and_filter_headers_footers(self, elements: List[Dict], total_pages: int) -> List[Dict]:
+        """Detecta textos repetidos en la parte superior/inferior de las páginas (encabezados/pies/páginas)
+        y filtra dichos elementos dinámicamente.
+
+        - Busca textos que aparezcan en la zona superior (<12% de la página) o inferior (>88%) en muchas páginas.
+        - Si un texto aparece en >= threshold páginas se considera encabezado/pie y se elimina.
+        - También detecta numeración de página (solo dígitos o 'N/N') que aparezca repetida y la elimina.
+        """
+        if not elements:
+            return elements
+
+        top_candidates = {}
+        bottom_candidates = {}
+        pages_seen_by_text_top = {}
+        pages_seen_by_text_bottom = {}
+        pages_seen_by_reduced_top = {}
+        pages_seen_by_reduced_bottom = {}
+        reduced_to_textkeys_top = {}
+        reduced_to_textkeys_bottom = {}
+
+        # Build candidate lists
+        for el in elements:
+            if el.get('type') != 'text':
+                continue
+            text = el.get('content', '').strip()
+            if not text:
+                continue
+            text_key = self._normalize_text_key(text)
+            page = el.get('page', 0)
+            page_height = el.get('page_height', None)
+            y_pos = el.get('y_position', None)
+            if page_height and y_pos is not None:
+                norm_y = float(y_pos) / float(page_height) if page_height else 0.5
+            else:
+                # si no tenemos tamaños, usar heurístico por bbox
+                bbox = el.get('bbox')
+                if bbox and len(bbox) >= 4:
+                    # bbox[1] es y0
+                    norm_y = float(bbox[1]) / float(bbox[3] - bbox[1] + 1)
+                else:
+                    norm_y = 0.5
+
+            if norm_y <= 0.12:
+                pages_seen_by_text_top.setdefault(text_key, set()).add(page)
+                top_candidates.setdefault(text_key, text)
+                # reduced form - solo letras, sin números para agrupar "neokhaos 1", "neokhaos 15", etc
+                reduced = re.sub(r'[^a-z]+', '', text_key).strip()
+                if reduced and len(reduced) >= 3:  # solo si hay al menos 3 letras
+                    pages_seen_by_reduced_top.setdefault(reduced, set()).add(page)
+                    reduced_to_textkeys_top.setdefault(reduced, set()).add(text_key)
+            elif norm_y >= 0.88:
+                pages_seen_by_text_bottom.setdefault(text_key, set()).add(page)
+                bottom_candidates.setdefault(text_key, text)
+                reduced = re.sub(r'[^a-z]+', '', text_key).strip()
+                if reduced and len(reduced) >= 3:  # solo si hay al menos 3 letras
+                    pages_seen_by_reduced_bottom.setdefault(reduced, set()).add(page)
+                    reduced_to_textkeys_bottom.setdefault(reduced, set()).add(text_key)
+
+        threshold = max(2, int(total_pages * 0.4))  # Umbral más bajo: 40% de páginas o mínimo 2
+
+        headers = {k for k, s in pages_seen_by_text_top.items() if len(s) >= threshold}
+        footers = {k for k, s in pages_seen_by_text_bottom.items() if len(s) >= threshold}
+
+        # also consider reduced keys (strip digits/punct) to catch footer/header variants with page numbers
+        reduced_headers = {r for r, s in pages_seen_by_reduced_top.items() if len(s) >= threshold}
+        reduced_footers = {r for r, s in pages_seen_by_reduced_bottom.items() if len(s) >= threshold}
+
+        for r in reduced_headers:
+            for tk in reduced_to_textkeys_top.get(r, []):
+                headers.add(tk)
+
+        for r in reduced_footers:
+            for tk in reduced_to_textkeys_bottom.get(r, []):
+                footers.add(tk)
+
+        # Detect numeric page numbers among candidates (also remove)
+        def is_page_number_text(s: str) -> bool:
+            s_strip = s.strip()
+            if re.match(r'^\d+$', s_strip):
+                return True
+            if re.match(r'^\d+\s*/\s*\d+$', s_strip):
+                return True
+            # Roman numerals? simple check
+            if re.match(r'^[ivxlcdm]+$', s_strip.lower()):
+                return True
+            return False
+
+        # Add numeric frequent candidates to headers/footers
+        for k in list(headers):
+            txt = k
+            if is_page_number_text(txt):
+                headers.add(k)
+
+        for k in list(footers):
+            txt = k
+            if is_page_number_text(txt):
+                footers.add(k)
+
+        # Now filter elements
+        cleaned = []
+        for el in elements:
+            if el.get('type') != 'text':
+                cleaned.append(el)
+                continue
+            text = el.get('content', '').strip()
+            text_key = self._normalize_text_key(text)
+
+            if text_key in headers or text_key in footers:
+                # skip repeated header/footer
+                continue
+
+            # also skip if detected as page number pattern and it appears frequently
+            if is_page_number_text(text_key):
+                # check how many pages this page number appears in candidate maps
+                top_count = len(pages_seen_by_text_top.get(text_key, set()))
+                bottom_count = len(pages_seen_by_text_bottom.get(text_key, set()))
+                if max(top_count, bottom_count) >= threshold:
+                    continue
+
+            cleaned.append(el)
+
+        return cleaned
 
     def clean_structured_content(self, elements: List[Dict], total_pages: int) -> List[Dict]:
         logger.info("🧹 Limpiando contenido estructurado...")
